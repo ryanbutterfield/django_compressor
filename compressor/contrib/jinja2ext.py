@@ -28,13 +28,13 @@ class CompressorExtension(CompressorMixin, Extension):
                 args.append(modearg)
         else:
             args.append(nodes.Const('file'))
+        args.append(nodes.ContextReference())
         body = parser.parse_statements(['name:endcompress'], drop_needle=True)
         return nodes.CallBlock(self.call_method('_compress', args), [], [],
             body).set_lineno(lineno)
 
-    def _compress(self, kind, mode, caller):
-        # This extension assumes that we won't force compression
-        forced = False
+    def _compress(self, kind, mode, context, caller):
+        forced = context.get('compress_forced', False)
 
         mode = mode or OUTPUT_FILE
         original_content = caller()

@@ -21,6 +21,22 @@ try:
 except ImportError:
     CachedLoader = None  # noqa
 
+try:
+    import jinja2
+except ImportError:
+    pass
+else:
+    try:
+        from django_jinja.base import env as jinja2_env
+    except ImportError:
+        try:
+            from coffin.common import env as jinja2_env
+        except ImportError:
+            try:
+                from jingo import env as jinja2_env
+            except ImportError:
+                jinja2_env = None
+
 from compressor.cache import get_offline_hexdigest, write_offline_manifest
 from compressor.conf import settings
 from compressor.exceptions import OfflineGenerationError
@@ -206,7 +222,7 @@ class Command(NoArgsCommand):
         for path in paths:
             for root, dirs, files in os.walk(path,
                     followlinks=options.get('followlinks', False)):
-                templates.update(os.path.join(root, name)
+                templates.update(os.path.relpath(os.path.join(root, name), path)
                     for name in files if not name.startswith('.') and
                         any(fnmatch(name, "*%s" % glob) for glob in extensions))
         if not templates:
@@ -219,8 +235,10 @@ class Command(NoArgsCommand):
         compressor_nodes = SortedDict()
         for template_name in templates:
             try:
-                with io.open(template_name, encoding=settings.FILE_CHARSET) as file:
-                    template = Template(file.read())
+                template = get_template(template_name)
+                if not isinstance(template, Template):
+                    template = jinja2_env.parse(jinja2_env.loader.get_source(jinja2_env, 
+                        template_name)[0]) # get AST version of template
             except IOError:  # unreadable file -> ignore
                 if verbosity > 0:
                     log.write("Unreadable template at: %s\n" % template_name)
@@ -261,22 +279,35 @@ class Command(NoArgsCommand):
             context = Context(settings.COMPRESS_OFFLINE_CONTEXT)
             template._log = log
             template._log_verbosity = verbosity
-            template._render_firstnode = MethodType(patched_render_firstnode, template)
-            extra_context = template._render_firstnode(context)
-            if extra_context is None:
-                # Something is wrong - ignore this template
-                continue
+            
+            if isinstance(template, Template):
+                template._render_firstnode = MethodType(patched_render_firstnode, template)
+                extra_context = template._render_firstnode(context)
+                if extra_context is None:
+                    # Something is wrong - ignore this template
+                    continue
+                
             for node in nodes:
                 context.push()
-                if extra_context and node._block_name:
-                    # Give a block context to the node if it was found inside
-                    # a {% block %}.
-                    context['block'] = context.render_context[BLOCK_CONTEXT_KEY].get_block(node._block_name)
-                    if context['block']:
-                        context['block'].context = context
-                key = get_offline_hexdigest(node.nodelist.render(context))
+                
                 try:
-                    result = node.render(context, forced=True)
+                    if isinstance(template, Template):
+                        if extra_context and node._block_name:
+                            # Give a block context to the node if it was found inside
+                            # a {% block %}.
+                            context['block'] = context.render_context[BLOCK_CONTEXT_KEY].get_block(node._block_name)
+                            if context['block']:
+                                context['block'].context = context
+                        key = get_offline_hexdigest(node.nodelist.render(context))
+                        result = node.render(context, forced=True)
+                        
+                    else:
+                        key = get_offline_hexdigest(self.create_jinja_template(node.body).render(
+                            self.dict_from_context(context)))
+                        context['compress_forced'] = True
+                        result = self.create_jinja_template([node]).render(
+                            self.dict_from_context(context))
+                
                 except Exception as e:
                     raise CommandError("An error occured during rendering %s: "
                                        "%s" % (template.template_name, e))
@@ -295,7 +326,28 @@ class Command(NoArgsCommand):
         # Check if node is an ```if``` switch with true and false branches
         if hasattr(node, 'nodelist_true') and hasattr(node, 'nodelist_false'):
             return node.nodelist_true + node.nodelist_false
-        return getattr(node, "nodelist", [])
+        return getattr(node, "nodelist", # django
+            getattr(node, "body", getattr(node, "nodes", []))) # jinja
+
+    def is_jinja_compressor_extension(self, node):
+        try:
+            return node.call.node.identifier.endswith('CompressorExtension') # endswith allows custom
+        except AttributeError:
+            return False
+    
+    def create_jinja_template(self, fields):
+        return jinja2.Template.from_code(jinja2_env,
+            jinja2_env.compile(jinja2.nodes.Template(fields)), {})
+    
+    def dict_from_context(self, context):
+        # Borrowed from django-jinja
+        if isinstance(context, Context):
+            new_dict = {}
+            for i in reversed(list(context)):
+                new_dict.update(self.dict_from_context(i))
+            return new_dict
+    
+        return dict(context)
 
     def walk_nodes(self, node, block_name=None):
         for node in self.get_nodelist(node):
@@ -303,6 +355,8 @@ class Command(NoArgsCommand):
                 block_name = node.name
             if isinstance(node, CompressorNode) and node.is_offline_compression_enabled(forced=True):
                 node._block_name = block_name
+                yield node
+            elif self.is_jinja_compressor_extension(node):
                 yield node
             else:
                 for node in self.walk_nodes(node, block_name=block_name):
